@@ -1,48 +1,46 @@
 import streamlit as st
-from streamlit_webrtc import webrtc_streamer, VideoTransformerBase
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
+import av
 import cv2
 import numpy as np
-# import cvlib as cv
-# from cvlib.object_detection import draw_bbox
 
-st.set_page_config(page_title="Live Webcam Analytics", layout="centered")
-st.title("🎯 Real-Time Face Detection & Alignment (Streamlit Cloud Compatible)")
+# Set Streamlit config
+st.set_page_config(page_title="Video Analytics using CNN", layout="centered")
 
-class VideoTransformer(VideoTransformerBase):
-    def transform(self, frame):
-        img = frame.to_ndarray(format="bgr24")
-        
-        # Face detection using cvlib
-        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, 1.1, 4)
-        
-        for (x, y, w, h) in faces:
-            center_x = x + w // 2
-            center_y = y + h // 2
-            cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            cv2.circle(img, (center_x, center_y), 5, (255, 0, 0), -1)
-            
-            img_h, img_w, _ = img.shape
-            alignment = "Centered ✅" if abs(center_x - img_w // 2) < img_w * 0.1 else "Not Centered ❌"
-            cv2.putText(img, alignment, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                        (0, 255, 255) if "✅" in alignment else (0, 0, 255), 2)
-            
-        for face in faces:
-            startX, startY, endX, endY = face
-            center_x = (startX + endX) // 2
-            center_y = (startY + endY) // 2
+# STUN config for WebRTC handshake
+RTC_CONFIGURATION = RTCConfiguration({
+    "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+})
 
-            # Draw rectangle around face
-            cv2.rectangle(img, (startX, startY), (endX, endY), (0, 255, 0), 2)
-            cv2.circle(img, (center_x, center_y), 5, (255, 0, 0), -1)
+st.title("📹 Real-Time Video Analytics with CNN")
 
-            # Check alignment
-            img_h, img_w, _ = img.shape
-            alignment = "Centered ✅" if abs(center_x - img_w // 2) < img_w * 0.1 else "Not Centered ❌"
-            cv2.putText(img, alignment, (startX, startY - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                        (0, 255, 255) if "✅" in alignment else (0, 0, 255), 2)
+st.markdown(
+    """
+This app uses your browser’s webcam to perform real-time video analysis using a simulated CNN model.
+If running on Streamlit Cloud, make sure your browser allows webcam access.
+"""
+)
 
-        return img
+# --- CNN-like processing placeholder ---
+def fake_cnn_processor(image):
+    """Simulate a CNN processing pipeline (e.g., edge detection)"""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    processed = cv2.Canny(gray, 100, 200)  # Just to simulate CNN-like output
+    return cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)  # Return 3-channel image
 
-webrtc_streamer(key="face-detect", video_transformer_factory=VideoTransformer)
+
+# --- Frame callback ---
+def video_frame_callback(frame):
+    img = frame.to_ndarray(format="bgr24")
+    processed_img = fake_cnn_processor(img)
+    return av.VideoFrame.from_ndarray(processed_img, format="bgr24")
+
+
+# --- Webcam streamer ---
+webrtc_streamer(
+    key="video-analytics",
+    mode=WebRtcMode.SENDRECV,
+    rtc_configuration=RTC_CONFIGURATION,
+    video_frame_callback=video_frame_callback,
+    media_stream_constraints={"video": True, "audio": False},
+)
