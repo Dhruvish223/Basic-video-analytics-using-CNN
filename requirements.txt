@@ -1,6 +1,5 @@
 streamlit==1.35.0
 opencv-python-headless==4.9.0.80
-streamlit-webrtc==0.45.0
-numpy==1.26.4
-setuptools==68.2.2
-cvlib
+streamlit-webrtc==0.45.1
+av==10.0.0
+numpy
