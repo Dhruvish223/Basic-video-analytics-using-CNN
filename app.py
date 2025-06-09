@@ -3,7 +3,7 @@ from streamlit_webrtc import webrtc_streamer, VideoTransformerBase
 import cv2
 import numpy as np
 # import cvlib as cv
-from cvlib.object_detection import draw_bbox
+# from cvlib.object_detection import draw_bbox
 
 st.set_page_config(page_title="Live Webcam Analytics", layout="centered")
 st.title("🎯 Real-Time Face Detection & Alignment (Streamlit Cloud Compatible)")
