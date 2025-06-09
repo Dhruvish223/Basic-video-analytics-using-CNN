@@ -4,10 +4,15 @@ import numpy as np
 import mediapipe as mp
 from PIL import Image
 import time
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
+import av
+import threading
+import queue
+import math
 
-# Configure Streamlit page
+# Page configuration
 st.set_page_config(
-    page_title="Live Webcam Analytics",
+    page_title="Live Video Analytics Dashboard",
     page_icon="📹",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -16,12 +21,10 @@ st.set_page_config(
 # Initialize MediaPipe
 @st.cache_resource
 def load_mediapipe_models():
-    """Load MediaPipe models with caching for better performance"""
     mp_face_detection = mp.solutions.face_detection
     mp_face_mesh = mp.solutions.face_mesh
     mp_pose = mp.solutions.pose
     mp_drawing = mp.solutions.drawing_utils
-    mp_drawing_styles = mp.solutions.drawing_styles
     
     face_detection = mp_face_detection.FaceDetection(
         model_selection=0, min_detection_confidence=0.5
@@ -33,282 +36,327 @@ def load_mediapipe_models():
         min_tracking_confidence=0.5
     )
     pose = mp_pose.Pose(
+        static_image_mode=False,
+        model_complexity=1,
+        smooth_landmarks=True,
+        enable_segmentation=False,
+        smooth_segmentation=True,
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5
     )
     
-    return face_detection, face_mesh, pose, mp_drawing, mp_drawing_styles
+    return face_detection, face_mesh, pose, mp_drawing
 
-def calculate_gaze_direction(landmarks, img_w, img_h):
-    """Calculate if user is looking at camera based on eye landmarks"""
-    try:
-        # Key landmarks for gaze detection
-        left_eye_left = landmarks[33]
-        left_eye_right = landmarks[133]
-        left_eye_top = landmarks[159]
-        left_eye_bottom = landmarks[145]
+# Global variables for analytics
+class VideoAnalytics:
+    def __init__(self):
+        self.face_detected = False
+        self.face_position = (0, 0)
+        self.looking_at_camera = False
+        self.posture_centered = False
+        self.head_pose = {"yaw": 0, "pitch": 0, "roll": 0}
+        self.shoulder_angle = 0
+        self.gaze_direction = "Unknown"
+        self.face_bbox = None
         
-        right_eye_left = landmarks[362]
-        right_eye_right = landmarks[263]
-        right_eye_top = landmarks[386]
-        right_eye_bottom = landmarks[374]
+    def calculate_head_pose(self, landmarks, image_shape):
+        """Calculate head pose angles"""
+        h, w = image_shape[:2]
         
-        # Calculate eye centers
-        left_eye_center_x = (left_eye_left.x + left_eye_right.x) / 2
-        left_eye_center_y = (left_eye_top.y + left_eye_bottom.y) / 2
+        # Key facial landmarks for head pose estimation
+        nose_tip = landmarks[1]
+        chin = landmarks[175]
+        left_eye_corner = landmarks[33]
+        right_eye_corner = landmarks[263]
+        left_mouth = landmarks[61]
+        right_mouth = landmarks[291]
         
-        right_eye_center_x = (right_eye_left.x + right_eye_right.x) / 2
-        right_eye_center_y = (right_eye_top.y + right_eye_bottom.y) / 2
+        # Convert normalized coordinates to pixel coordinates
+        nose_tip = (int(nose_tip.x * w), int(nose_tip.y * h))
+        chin = (int(chin.x * w), int(chin.y * h))
+        left_eye = (int(left_eye_corner.x * w), int(left_eye_corner.y * h))
+        right_eye = (int(right_eye_corner.x * w), int(right_eye_corner.y * h))
+        left_mouth = (int(left_mouth.x * w), int(left_mouth.y * h))
+        right_mouth = (int(right_mouth.x * w), int(right_mouth.y * h))
         
-        # Calculate relative positions of pupils within eyes
-        eye_center_avg_x = (left_eye_center_x + right_eye_center_x) / 2
-        eye_center_avg_y = (left_eye_center_y + right_eye_center_y) / 2
+        # Calculate yaw (left-right head turn)
+        eye_center_x = (left_eye[0] + right_eye[0]) / 2
+        face_center_x = w / 2
+        yaw = (eye_center_x - face_center_x) / (w / 2) * 45  # Normalize to degrees
         
-        # Check if looking at camera (eyes relatively centered)
-        gaze_threshold = 0.02
-        looking_at_camera = (
-            abs(eye_center_avg_x - 0.5) < gaze_threshold and
-            abs(eye_center_avg_y - 0.5) < gaze_threshold
+        # Calculate pitch (up-down head tilt)
+        nose_chin_dist = abs(nose_tip[1] - chin[1])
+        pitch = (nose_tip[1] - h/2) / (h/2) * 30  # Normalize to degrees
+        
+        # Calculate roll (head tilt left-right)
+        eye_angle = math.atan2(right_eye[1] - left_eye[1], right_eye[0] - left_eye[0])
+        roll = math.degrees(eye_angle)
+        
+        self.head_pose = {"yaw": yaw, "pitch": pitch, "roll": roll}
+        
+        # Determine if looking at camera (within threshold)
+        if abs(yaw) < 15 and abs(pitch) < 15:
+            self.looking_at_camera = True
+            self.gaze_direction = "Looking at camera"
+        elif yaw > 15:
+            self.looking_at_camera = False
+            self.gaze_direction = "Looking right"
+        elif yaw < -15:
+            self.looking_at_camera = False
+            self.gaze_direction = "Looking left"
+        elif pitch > 15:
+            self.looking_at_camera = False
+            self.gaze_direction = "Looking down"
+        elif pitch < -15:
+            self.looking_at_camera = False
+            self.gaze_direction = "Looking up"
+        else:
+            self.looking_at_camera = False
+            self.gaze_direction = "Looking away"
+    
+    def calculate_posture(self, pose_landmarks, image_shape):
+        """Calculate posture alignment"""
+        if not pose_landmarks:
+            return
+            
+        h, w = image_shape[:2]
+        
+        # Get shoulder landmarks
+        left_shoulder = pose_landmarks.landmark[11]
+        right_shoulder = pose_landmarks.landmark[12]
+        
+        # Convert to pixel coordinates
+        left_shoulder_px = (int(left_shoulder.x * w), int(left_shoulder.y * h))
+        right_shoulder_px = (int(right_shoulder.x * w), int(right_shoulder.y * h))
+        
+        # Calculate shoulder center
+        shoulder_center_x = (left_shoulder_px[0] + right_shoulder_px[0]) / 2
+        frame_center_x = w / 2
+        
+        # Calculate shoulder angle
+        shoulder_angle = math.atan2(
+            right_shoulder_px[1] - left_shoulder_px[1],
+            right_shoulder_px[0] - left_shoulder_px[0]
         )
+        self.shoulder_angle = math.degrees(shoulder_angle)
         
-        return looking_at_camera, eye_center_avg_x, eye_center_avg_y
-        
-    except Exception:
-        return False, 0.5, 0.5
+        # Check if centered (within 10% of frame width)
+        center_threshold = w * 0.1
+        self.posture_centered = abs(shoulder_center_x - frame_center_x) < center_threshold
 
-def analyze_posture(pose_landmarks, img_w, img_h):
-    """Analyze user posture alignment"""
-    try:
-        # Key landmarks for posture analysis
-        left_shoulder = pose_landmarks.landmark[mp.solutions.pose.PoseLandmark.LEFT_SHOULDER]
-        right_shoulder = pose_landmarks.landmark[mp.solutions.pose.PoseLandmark.RIGHT_SHOULDER]
-        nose = pose_landmarks.landmark[mp.solutions.pose.PoseLandmark.NOSE]
-        
-        # Calculate shoulder alignment
-        shoulder_diff_y = abs(left_shoulder.y - right_shoulder.y)
-        shoulder_tilt = shoulder_diff_y < 0.05  # Threshold for level shoulders
-        
-        # Calculate center alignment
-        shoulder_center_x = (left_shoulder.x + right_shoulder.x) / 2
-        center_aligned = abs(shoulder_center_x - 0.5) < 0.1  # Threshold for center alignment
-        
-        # Calculate head position relative to shoulders
-        head_aligned = abs(nose.x - shoulder_center_x) < 0.08
-        
-        overall_posture_good = shoulder_tilt and center_aligned and head_aligned
-        
-        return {
-            'shoulder_level': shoulder_tilt,
-            'center_aligned': center_aligned,
-            'head_aligned': head_aligned,
-            'overall_good': overall_posture_good,
-            'shoulder_center_x': shoulder_center_x,
-            'head_x': nose.x
-        }
-        
-    except Exception:
-        return {
-            'shoulder_level': False,
-            'center_aligned': False,
-            'head_aligned': False,
-            'overall_good': False,
-            'shoulder_center_x': 0.5,
-            'head_x': 0.5
-        }
+# Initialize analytics
+analytics = VideoAnalytics()
 
-def process_frame(frame, face_detection, face_mesh, pose, mp_drawing, mp_drawing_styles):
-    """Process a single frame and return analytics"""
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    h, w, _ = frame.shape
+# Video processor class
+class VideoProcessor:
+    def __init__(self):
+        self.face_detection, self.face_mesh, self.pose, self.mp_drawing = load_mediapipe_models()
     
-    # Face detection
-    face_results = face_detection.process(rgb_frame)
-    face_mesh_results = face_mesh.process(rgb_frame)
-    pose_results = pose.process(rgb_frame)
-    
-    analytics = {
-        'face_detected': False,
-        'face_position': {'x': 0, 'y': 0, 'width': 0, 'height': 0},
-        'looking_at_camera': False,
-        'gaze_position': {'x': 0.5, 'y': 0.5},
-        'posture': {
-            'shoulder_level': False,
-            'center_aligned': False,
-            'head_aligned': False,
-            'overall_good': False,
-            'shoulder_center_x': 0.5,
-            'head_x': 0.5
-        }
-    }
-    
-    # Process face detection
-    if face_results.detections:
-        for detection in face_results.detections:
+    def process_frame(self, frame):
+        # Convert BGR to RGB
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # Face detection
+        face_results = self.face_detection.process(rgb_frame)
+        face_mesh_results = self.face_mesh.process(rgb_frame)
+        pose_results = self.pose.process(rgb_frame)
+        
+        # Process face detection
+        if face_results.detections:
+            analytics.face_detected = True
+            detection = face_results.detections[0]
             bbox = detection.location_data.relative_bounding_box
-            analytics['face_detected'] = True
-            analytics['face_position'] = {
-                'x': bbox.xmin,
-                'y': bbox.ymin,
-                'width': bbox.width,
-                'height': bbox.height
-            }
+            h, w = frame.shape[:2]
+            
+            # Calculate face position
+            face_x = int((bbox.xmin + bbox.width/2) * w)
+            face_y = int((bbox.ymin + bbox.height/2) * h)
+            analytics.face_position = (face_x, face_y)
             
             # Draw face bounding box
             x = int(bbox.xmin * w)
             y = int(bbox.ymin * h)
             width = int(bbox.width * w)
             height = int(bbox.height * h)
-            cv2.rectangle(frame, (x, y), (x + width, y + height), (0, 255, 0), 2)
-            cv2.putText(frame, 'Face Detected', (x, y-10), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-    
-    # Process gaze detection
-    if face_mesh_results.multi_face_landmarks:
-        for face_landmarks in face_mesh_results.multi_face_landmarks:
-            looking_at_camera, gaze_x, gaze_y = calculate_gaze_direction(
-                face_landmarks.landmark, w, h
-            )
-            analytics['looking_at_camera'] = looking_at_camera
-            analytics['gaze_position'] = {'x': gaze_x, 'y': gaze_y}
             
-            # Draw gaze indicator
-            gaze_color = (0, 255, 0) if looking_at_camera else (0, 0, 255)
-            gaze_text = "Looking at Camera" if looking_at_camera else "Not Looking at Camera"
-            cv2.putText(frame, gaze_text, (10, 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, gaze_color, 2)
-    
-    # Process posture analysis
-    if pose_results.pose_landmarks:
-        posture_analysis = analyze_posture(pose_results.pose_landmarks, w, h)
-        analytics['posture'] = posture_analysis
+            cv2.rectangle(frame, (x, y), (x + width, y + height), (0, 255, 0), 2)
+            analytics.face_bbox = (x, y, width, height)
+        else:
+            analytics.face_detected = False
+            analytics.face_bbox = None
         
-        # Draw pose landmarks
-        mp_drawing.draw_landmarks(
-            frame,
-            pose_results.pose_landmarks,
-            mp.solutions.pose.POSE_CONNECTIONS,
-            landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style()
-        )
+        # Process face mesh for head pose
+        if face_mesh_results.multi_face_landmarks:
+            for face_landmarks in face_mesh_results.multi_face_landmarks:
+                analytics.calculate_head_pose(face_landmarks.landmark, frame.shape)
         
-        # Draw posture status
-        posture_color = (0, 255, 0) if posture_analysis['overall_good'] else (0, 165, 255)
-        posture_text = "Good Posture" if posture_analysis['overall_good'] else "Poor Posture"
-        cv2.putText(frame, posture_text, (10, 60), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, posture_color, 2)
+        # Process pose for posture analysis
+        if pose_results.pose_landmarks:
+            analytics.calculate_posture(pose_results.pose_landmarks, frame.shape)
+            
+            # Draw pose landmarks (shoulders only for cleaner visualization)
+            landmarks = pose_results.pose_landmarks.landmark
+            h, w = frame.shape[:2]
+            
+            left_shoulder = (int(landmarks[11].x * w), int(landmarks[11].y * h))
+            right_shoulder = (int(landmarks[12].x * w), int(landmarks[12].y * h))
+            
+            cv2.circle(frame, left_shoulder, 5, (255, 0, 0), -1)
+            cv2.circle(frame, right_shoulder, 5, (255, 0, 0), -1)
+            cv2.line(frame, left_shoulder, right_shoulder, (255, 0, 0), 2)
         
-        # Draw alignment indicators
-        if not posture_analysis['center_aligned']:
-            cv2.putText(frame, "Move to Center", (10, 90), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
-        if not posture_analysis['shoulder_level']:
-            cv2.putText(frame, "Level Shoulders", (10, 120), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
-    
-    return frame, analytics
+        return frame
 
+# WebRTC callback
+def video_frame_callback(frame):
+    img = frame.to_ndarray(format="bgr24")
+    
+    # Process the frame
+    processor = VideoProcessor()
+    processed_img = processor.process_frame(img)
+    
+    return av.VideoFrame.from_ndarray(processed_img, format="bgr24")
+
+# Streamlit UI
 def main():
-    st.title("🎥 Live Webcam Analytics Dashboard")
-    st.markdown("Real-time face detection, gaze tracking, and posture analysis")
+    st.title("🎥 Live Video Analytics Dashboard")
+    st.markdown("Real-time face detection, gaze tracking, and posture analysis for interviews and presentations")
     
-    # Load MediaPipe models
-    face_detection, face_mesh, pose, mp_drawing, mp_drawing_styles = load_mediapipe_models()
-    
-    # Sidebar controls
-    st.sidebar.header("📊 Controls")
-    enable_recording = st.sidebar.checkbox("Enable Analytics", value=True)
-    confidence_threshold = st.sidebar.slider("Detection Confidence", 0.1, 1.0, 0.5, 0.1)
-    
-    # Create columns for layout
+    # Sidebar for settings
+    with st.sidebar:
+        st.header("⚙️ Settings")
+        
+        # Analytics thresholds
+        st.subheader("Detection Thresholds")
+        gaze_threshold = st.slider("Gaze Detection Sensitivity", 5, 30, 15)
+        posture_threshold = st.slider("Posture Centering Threshold (%)", 5, 20, 10)
+        
+        # Display options
+        st.subheader("Display Options")
+        show_landmarks = st.checkbox("Show Face Landmarks", value=True)
+        show_pose = st.checkbox("Show Pose Points", value=True)
+        
+    # Main content area
     col1, col2 = st.columns([2, 1])
     
     with col1:
         st.subheader("📹 Live Video Feed")
         
-        # Webcam input
-        camera_input = st.camera_input("Take a picture or start video", key="camera")
+        # WebRTC configuration for better connectivity
+        RTC_CONFIGURATION = RTCConfiguration({
+            "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+        })
         
-        if camera_input is not None and enable_recording:
-            # Convert uploaded image to OpenCV format
-            image = Image.open(camera_input)
-            frame = np.array(image)
-            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            
-            # Process frame
-            processed_frame, analytics = process_frame(
-                frame_bgr, face_detection, face_mesh, pose, mp_drawing, mp_drawing_styles
-            )
-            
-            # Convert back to RGB for display
-            processed_frame_rgb = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
-            st.image(processed_frame_rgb, caption="Processed Video Feed", use_column_width=True)
-            
-            # Display analytics in sidebar
-            with col2:
-                st.subheader("📊 Real-time Analytics")
-                
-                # Face Detection Status
-                st.markdown("### 👤 Face Detection")
-                if analytics['face_detected']:
-                    st.success("✅ Face Detected")
-                    face_pos = analytics['face_position']
-                    st.write(f"**Position:** X: {face_pos['x']:.2f}, Y: {face_pos['y']:.2f}")
-                    st.write(f"**Size:** W: {face_pos['width']:.2f}, H: {face_pos['height']:.2f}")
-                else:
-                    st.error("❌ No Face Detected")
-                
-                # Gaze Detection Status
-                st.markdown("### 👁️ Gaze Detection")
-                if analytics['looking_at_camera']:
-                    st.success("✅ Looking at Camera")
-                else:
-                    st.warning("⚠️ Not Looking at Camera")
-                
-                gaze_pos = analytics['gaze_position']
-                st.write(f"**Gaze Position:** X: {gaze_pos['x']:.2f}, Y: {gaze_pos['y']:.2f}")
-                
-                # Posture Analysis
-                st.markdown("### 🧍 Posture Analysis")
-                posture = analytics['posture']
-                
-                if posture['overall_good']:
-                    st.success("✅ Good Posture")
-                else:
-                    st.warning("⚠️ Poor Posture")
-                
-                # Detailed posture breakdown
-                st.write("**Alignment Details:**")
-                st.write(f"• Shoulders Level: {'✅' if posture['shoulder_level'] else '❌'}")
-                st.write(f"• Center Aligned: {'✅' if posture['center_aligned'] else '❌'}")
-                st.write(f"• Head Aligned: {'✅' if posture['head_aligned'] else '❌'}")
-                
-                # Progress bars for alignment
-                st.markdown("### 📈 Alignment Metrics")
-                
-                center_score = 1.0 - abs(posture.get('shoulder_center_x', 0.5) - 0.5) * 2
-                st.progress(max(0, min(1, center_score)), text="Center Alignment")
-                
-                head_alignment_score = 1.0 - abs(posture.get('head_x', 0.5) - posture.get('shoulder_center_x', 0.5)) * 10
-                st.progress(max(0, min(1, head_alignment_score)), text="Head Alignment")
+        # Start video stream
+        webrtc_ctx = webrtc_streamer(
+            key="video-analytics",
+            mode=WebRtcMode.SENDRECV,
+            rtc_configuration=RTC_CONFIGURATION,
+            video_frame_callback=video_frame_callback,
+            media_stream_constraints={"video": True, "audio": False},
+            async_processing=True,
+        )
+    
+    with col2:
+        st.subheader("📊 Real-time Analytics")
         
-        else:
-            with col2:
-                st.info("📷 Enable analytics and take a photo to start analysis")
+        # Create placeholders for real-time updates
+        face_status = st.empty()
+        gaze_status = st.empty()
+        posture_status = st.empty()
+        metrics_container = st.empty()
+        
+        # Real-time updates
+        if webrtc_ctx.state.playing:
+            while True:
+                time.sleep(0.1)  # Update every 100ms
+                
+                with face_status.container():
+                    if analytics.face_detected:
+                        st.success("✅ Face Detected")
+                        if analytics.face_bbox:
+                            x, y, w, h = analytics.face_bbox
+                            st.caption(f"Position: ({x + w//2}, {y + h//2})")
+                    else:
+                        st.error("❌ No Face Detected")
+                
+                with gaze_status.container():
+                    if analytics.looking_at_camera:
+                        st.success(f"👁️ {analytics.gaze_direction}")
+                    else:
+                        st.warning(f"👁️ {analytics.gaze_direction}")
+                    
+                    # Head pose details
+                    if analytics.head_pose["yaw"] != 0:
+                        st.caption(f"Yaw: {analytics.head_pose['yaw']:.1f}°")
+                        st.caption(f"Pitch: {analytics.head_pose['pitch']:.1f}°")
+                
+                with posture_status.container():
+                    if analytics.posture_centered:
+                        st.success("🎯 Posture: Centered")
+                    else:
+                        st.warning("🎯 Posture: Off-center")
+                    
+                    if analytics.shoulder_angle != 0:
+                        st.caption(f"Shoulder angle: {analytics.shoulder_angle:.1f}°")
+                
+                with metrics_container.container():
+                    st.subheader("📈 Session Metrics")
+                    
+                    # Create metrics
+                    col_a, col_b = st.columns(2)
+                    
+                    with col_a:
+                        face_score = 100 if analytics.face_detected else 0
+                        st.metric("Face Detection", f"{face_score}%")
+                        
+                        gaze_score = 100 if analytics.looking_at_camera else 0
+                        st.metric("Eye Contact", f"{gaze_score}%")
+                    
+                    with col_b:
+                        posture_score = 100 if analytics.posture_centered else 0
+                        st.metric("Posture", f"{posture_score}%")
+                        
+                        overall_score = (face_score + gaze_score + posture_score) / 3
+                        st.metric("Overall Score", f"{overall_score:.1f}%")
+                
+                # Break if stream stops
+                if not webrtc_ctx.state.playing:
+                    break
     
     # Instructions
-    st.markdown("---")
-    st.markdown("""
-    ### 📋 Instructions:
-    1. **Click the camera button** to capture your image
-    2. **Enable Analytics** in the sidebar to start real-time analysis
-    3. **Position yourself** so your face is clearly visible
-    4. **Look directly at the camera** for optimal gaze detection
-    5. **Sit up straight** and center yourself for good posture analysis
+    with st.expander("📋 How to Use"):
+        st.markdown("""
+        ### Instructions:
+        1. **Allow camera access** when prompted by your browser
+        2. **Position yourself** in front of the camera at arm's length
+        3. **Monitor the analytics** in real-time on the right panel
+        
+        ### Analytics Explained:
+        - **Face Detection**: Shows if your face is clearly visible
+        - **Eye Contact**: Indicates if you're looking directly at the camera
+        - **Posture**: Checks if you're centered and aligned properly
+        
+        ### Tips for Best Results:
+        - Ensure good lighting on your face
+        - Keep your head and shoulders in frame
+        - Maintain steady positioning
+        - Look directly at the camera lens, not the screen
+        """)
     
-    ### 📊 Analytics Explained:
-    - **Face Detection**: Identifies and tracks your face position
-    - **Gaze Detection**: Determines if you're looking directly at the camera
-    - **Posture Analysis**: Evaluates your sitting position and alignment
-    """)
+    # Technical info
+    with st.expander("🔧 Technical Details"):
+        st.markdown("""
+        ### Technology Stack:
+        - **Computer Vision**: MediaPipe for face detection and pose estimation
+        - **Real-time Processing**: WebRTC for low-latency video streaming
+        - **Analytics**: Custom algorithms for gaze and posture analysis
+        
+        ### Performance Optimizations:
+        - Optimized MediaPipe model settings for speed
+        - Efficient frame processing pipeline
+        - Minimal UI updates to reduce latency
+        """)
 
 if __name__ == "__main__":
     main()
